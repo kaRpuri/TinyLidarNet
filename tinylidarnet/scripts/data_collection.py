@@ -1,59 +1,111 @@
-# Import necessary libraries
-import rosbag
+# data_collection.py
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
+from rosbag2_py import SequentialWriter, StorageOptions, ConverterOptions, TopicMetadata
+from rclpy.serialization import serialize_message
 import message_filters
-from sensor_msgs.msg import Joy
-from sensor_msgs.msg import LaserScan
+import numpy as np
+from sensor_msgs.msg import Joy, LaserScan
 from ackermann_msgs.msg import AckermannDriveStamped
 
-# Global variables
-drive = '/vesc/low_level/ackermann_cmd_mux/input/teleop'  # Topic for drive commands
-joy = '/vesc/joy'  # Topic for joystick commands
-lid = '/scan_filtered'  # Lidar topic (filtered)
-pressed = False  # Button press flag
-bag = None  # ROS Bag to store collected data
-bag_name = 'Dataset/out.bag' # path and name of the bag where the data needs to be stored
+class DataCollectionNode(Node):
+    def __init__(self):
+        super().__init__('data_collection_node')
+        self.pressed = False
+        self.writer = None
+        
+        # ROS2 QoS Configuration
+        lidar_qos = QoSProfile(
+            depth=10,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE
+        )
+        
+        # Create subscribers
+        self.drive_sub = message_filters.Subscriber(
+            self, AckermannDriveStamped, '/vesc/low_level/ackermann_cmd_mux/input/teleop'
+        )
+        self.lid_sub = message_filters.Subscriber(
+            self, LaserScan, '/scan_filtered', qos_profile=lidar_qos
+        )
+        
+        # Time synchronizer
+        self.ts = message_filters.ApproximateTimeSynchronizer(
+            [self.drive_sub, self.lid_sub],
+            queue_size=10,
+            slop=0.01
+        )
+        self.ts.registerCallback(self.sync_callback)
+        
+        # Joystick subscriber
+        self.create_subscription(Joy, '/vesc/joy', self.button_callback, 10)
 
-# ROS initialization
-rospy.init_node('receive_position')
+    def init_bag_writer(self):
+        storage_options = StorageOptions(
+            uri='Dataset/out_bag',
+            storage_id='sqlite3'
+        )
+        converter_options = ConverterOptions('', '')
+        
+        self.writer = SequentialWriter()
+        self.writer.open(storage_options, converter_options)
+        
+        # Define topics metadata
+        ackermann_topic = TopicMetadata(
+            name='Ackermann',
+            type='ackermann_msgs/msg/AckermannDriveStamped',
+            serialization_format='cdr'
+        )
+        
+        lidar_topic = TopicMetadata(
+            name='Lidar',
+            type='sensor_msgs/msg/LaserScan',
+            serialization_format='cdr'
+        )
+        
+        self.writer.create_topic(ackermann_topic)
+        self.writer.create_topic(lidar_topic)
 
-# Callback for receiving Ackermann and Lidar messages
-def callback(ack_msg, ldr_msg):
-    if pressed and bag is not None:
-        print(f'Ackermann: {ack_msg}')
-        print(f'Lidar: {ldr_msg}')
-        bag.write('Ackermann', ack_msg)  # Write Ackermann messages to bag
-        bag.write('Lidar', ldr_msg)  # Write Lidar messages to bag
+    def sync_callback(self, ack_msg, ldr_msg):
+        if self.pressed and self.writer:
+            try:
+                self.writer.write(
+                    'Ackermann',
+                    serialize_message(ack_msg),
+                    self.get_clock().now().nanoseconds
+                )
+                self.writer.write(
+                    'Lidar',
+                    serialize_message(ldr_msg),
+                    self.get_clock().now().nanoseconds
+                )
+            except Exception as e:
+                self.get_logger().error(f'Bag write error: {str(e)}')
 
-# Callback for receiving button press from joystick
-def button_callback(j):
-    global pressed
-    global bag
+    def button_callback(self, j):
+        if j.buttons[1] == 1 and not self.pressed:
+            self.pressed = True
+            self.init_bag_writer()
+            self.get_logger().info('Recording Started')
+        elif j.buttons[1] == 0 and self.pressed:
+            self.pressed = False
+            self.writer.close()
+            self.get_logger().info('Recording Stopped')
 
-    # Check if button 1 is pressed which is mapped to button A of Logistic Joystick
-    if j.buttons[1] == 1 and not pressed:
-        pressed = True
-        bag = rosbag.Bag(bag_name, 'w')  # Create a new bag for recording
-        print('Recording Started')
-    elif j.buttons[1] == 0 and pressed:
-        pressed = False
-        bag.close()  # Close the bag when recording stops
-        print('Recording Stopped')
+def main(args=None):
+    rclpy.init(args=args)
+    node = DataCollectionNode()
+    
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if node.writer:
+            node.writer.close()
+        node.destroy_node()
+        rclpy.shutdown()
 
-# Create subscribers for drive and lidar messages
-drive_sub = message_filters.Subscriber(drive, AckermannDriveStamped)
-lid_sub = message_filters.Subscriber(lid, LaserScan)
-
-# Use time synchronizer to combine messages from both topics
-ts = message_filters.ApproximateTimeSynchronizer([drive_sub, lid_sub], queue_size=10, slop=0.01, allow_headerless=True)
-
-# Subscribe to joystick topic to receive button press
-rospy.Subscriber(joy, Joy, button_callback)
-
-# Register the callback function
-ts.registerCallback(callback)
-
-# Keep the program running
-rospy.spin()
-
-# End of data collection
-print('\n-----------Recording Completed-----------')
+if __name__ == '__main__':
+    main()
