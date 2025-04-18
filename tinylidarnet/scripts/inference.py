@@ -5,7 +5,7 @@ import rclpy
 from rclpy.node import Node
 import tensorflow as tf
 from sensor_msgs.msg import LaserScan, Joy
-from ackermann_msgs.msg import AckermannDriveStamped
+from geometry_msgs.msg import Twist  # Changed from AckermannDriveStamped
 from std_msgs.msg import Float64
 from nav_msgs.msg import Odometry
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
@@ -16,7 +16,7 @@ class AutonomousNode(Node):
         
         # Parameters and Variables
         self.subsample_lidar = 2
-        self.model_name = './Models/TLN_M_noquantized.tflite'
+        self.model_name = './Models/TLN_noquantized.tflite'
         self.prev = 0
         self.curr = 0
         self.start_position = None
@@ -26,45 +26,38 @@ class AutonomousNode(Node):
         self.hz = 40
         self.period = 1.0 / self.hz
         
-        # ROS2 QoS Profiles
+        # ROS2 QoS Profiles (Match data collection)
         lidar_qos = QoSProfile(
             depth=10,
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE
         )
         
-        # Publishers
-        self.servo_pub = self.create_publisher(
-            AckermannDriveStamped,
-            '/vesc/low_level/ackermann_cmd_mux/input/teleop',
+        # Publishers (Updated to Twist)
+        self.cmd_pub = self.create_publisher(
+            Twist,          # Changed from AckermannDriveStamped
+            '/cmd_vel',     # Match data collection topic
             10
         )
         
-        # Subscribers
+        # Subscribers (Updated topics)
         self.create_subscription(
             Joy,
-            '/vesc/joy',
+            '/joy',         # Match data collection topic
             self.button_callback,
             10
         )
         
         self.create_subscription(
             LaserScan,
-            '/scan_filtered',
+            '/scan',        # Changed from /scan_filtered
             self.lidar_callback,
             lidar_qos
         )
         
         self.create_subscription(
-            Float64,
-            '/vesc/commands/motor/speed',
-            self.rpm_callback,
-            10
-        )
-        
-        self.create_subscription(
             Odometry,
-            '/vesc/odom',
+            '/ego_racecar/odom',  # Match data collection topic
             self.odom_callback,
             10
         )
@@ -80,19 +73,19 @@ class AutonomousNode(Node):
         self.start_ts = time.time()
 
     def lidar_callback(self, msg):
-        ldata = msg.ranges[::self.subsample_lidar]
+        # Handle NaN/inf values like in training
+        cleaned_ranges = np.nan_to_num(msg.ranges, posinf=0.0, neginf=0.0)
+        ldata = cleaned_ranges[::self.subsample_lidar]
         ldata = np.expand_dims(ldata, axis=-1).astype(np.float32)
         self.lidar_data = np.expand_dims(ldata, axis=0)
 
     def button_callback(self, msg):
-        self.curr = msg.buttons[0]
+        # Use Button 0 (A) for control toggle
+        self.curr = msg.buttons[0]  # Changed from buttons[1]
         if self.curr == 1 and self.curr != self.prev:
             new_value = not self.get_parameter('is_joy').value
             self.set_parameters([rclpy.parameter.Parameter('is_joy', rclpy.Parameter.Type.BOOL, new_value)])
         self.prev = self.curr
-
-    def rpm_callback(self, msg):
-        self.wheel_speed = msg.data
 
     def odom_callback(self, msg):
         current_position = [msg.pose.pose.position.x, msg.pose.pose.position.y]
@@ -119,16 +112,19 @@ class AutonomousNode(Node):
         self.get_logger().info(f'Manual Control: {"ON" if self.is_joy else "OFF"} | Distance: {self.total_distance:.2f}m')
         
         if not self.is_joy and self.lidar_data is not None:
-            msg = AckermannDriveStamped()
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.header.frame_id = "base_link"
+            msg = Twist()  # Changed from AckermannDriveStamped
             
-            servo, speed = self.dnn_output()
-            speed = self.linear_map(speed, 0, 1, -0.5, 7.0)
+            # Get and map outputs (match training normalization)
+            steering, speed = self.dnn_output()
             
-            msg.drive.speed = float(speed)
-            msg.drive.steering_angle = float(servo)
-            self.servo_pub.publish(msg)
+            # Reverse mapping from training
+            speed = self.linear_map(speed, 0, 1, -0.5, 7.0)  # Match train.py params
+            steering = self.linear_map(steering, -1, 1, -0.34, 0.34)  # Typical steering range
+            
+            msg.linear.x = float(speed)
+            msg.angular.z = float(steering)  # Using angular.z for steering
+            
+            self.cmd_pub.publish(msg)
             
             dur = time.time() - self.start_ts
             if dur > self.period:
