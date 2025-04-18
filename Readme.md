@@ -21,14 +21,16 @@
 ### 1. Clone the Repository
 
 ```bash
-git clone <your-repo-url> Multi-Modal-TinyLidarNet
-cd Multi-Modal-TinyLidarNet
+git clone https://github.com/kaRpuri/TinyLidarNet.git
+cd TinyLidarNet
 ```
 
 ### 2. Create the Conda Environment
 
 ```bash
 conda env create -f environment.yml
+conda install pip
+which pip   # make sure that you are using the correct pip
 conda activate tln
 ```
 
@@ -45,21 +47,21 @@ Source your ROS 2 setup script in every new terminal:
 ### Data Collection
 
 ```bash
-cd scripts
+cd tinylidarnet/scripts
 python data_collection.py
 ```
 
 ### Training
 
 ```bash
-cd scripts
+cd tinylidarnet/scripts
 python train.py
 ```
 
 ### Inference
 
 ```bash
-cd scripts
+cd tinylidarnet/scripts
 python inference.py
 ```
 
