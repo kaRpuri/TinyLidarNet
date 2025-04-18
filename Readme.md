@@ -45,21 +45,21 @@ Source your ROS 2 setup script in every new terminal:
 ### Data Collection
 
 ```bash
-cd scripts
+cd tinylidarnet/scripts
 python data_collection.py
 ```
 
 ### Training
 
 ```bash
-cd scripts
+cd tinylidarnet/scripts
 python train.py
 ```
 
 ### Inference
 
 ```bash
-cd scripts
+cd tinylidarnet/scripts
 python inference.py
 ```
 
