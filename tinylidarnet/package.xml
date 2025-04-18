@@ -4,6 +4,7 @@
   <name>tinylidarnet</name>
   <version>0.0.0</version>
   <description>tinylidarnet</description>
+  <maintainer email="kapuri@seas.upenn.edu">kaRpuri</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>

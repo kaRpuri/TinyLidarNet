@@ -22,6 +22,8 @@ setup(
     zip_safe=True,
     description='tinylidarnet',
     license='MIT',
+    maintainer='kaRpuri',
+    maintainer_email='kapuri@seas.upenn.edu',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [

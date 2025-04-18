@@ -1,49 +1,48 @@
-# data_collection.py
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
 from rosbag2_py import SequentialWriter, StorageOptions, ConverterOptions, TopicMetadata
 from rclpy.serialization import serialize_message
 import message_filters
-import numpy as np
-from sensor_msgs.msg import Joy, LaserScan
-from ackermann_msgs.msg import AckermannDriveStamped
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
 
 class DataCollectionNode(Node):
     def __init__(self):
-        super().__init__('data_collection_node')
-        self.pressed = False
-        self.writer = None
+        super().__init__('sim_data_collector')
+        self.msg_counter = 0  # Add message counter
         
-        # ROS2 QoS Configuration
-        lidar_qos = QoSProfile(
-            depth=10,
+        # Initialize bag writer immediately
+        self.writer = None
+        self.init_bag_writer()
+        
+        # Configure QoS for sensor data
+        sensor_qos = QoSProfile(
+            depth=20,
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE
         )
         
-        # Create subscribers
-        self.drive_sub = message_filters.Subscriber(
-            self, AckermannDriveStamped, '/vesc/low_level/ackermann_cmd_mux/input/teleop'
-        )
-        self.lid_sub = message_filters.Subscriber(
-            self, LaserScan, '/scan_filtered', qos_profile=lidar_qos
-        )
+        # Initialize synchronized subscribers
+        self.drive_sub = message_filters.Subscriber(self, Twist, '/cmd_vel')
+        self.odom_sub = message_filters.Subscriber(self, Odometry, '/ego_racecar/odom')
+        self.lidar_sub = message_filters.Subscriber(self, LaserScan, '/scan', qos_profile=sensor_qos)
         
-        # Time synchronizer
+        # Setup time synchronizer
         self.ts = message_filters.ApproximateTimeSynchronizer(
-            [self.drive_sub, self.lid_sub],
-            queue_size=10,
-            slop=0.01
+            [self.drive_sub, self.odom_sub, self.lidar_sub],
+            queue_size=15,
+            slop=0.05,
+            allow_headerless=True
         )
-        self.ts.registerCallback(self.sync_callback)
+        self.ts.registerCallback(self.sensor_callback)
         
-        # Joystick subscriber
-        self.create_subscription(Joy, '/vesc/joy', self.button_callback, 10)
+        self.get_logger().info('Data collector node initialized!')
 
     def init_bag_writer(self):
         storage_options = StorageOptions(
-            uri='Dataset/out_bag',
+            uri='sim_Dataset/testrun2',
             storage_id='sqlite3'
         )
         converter_options = ConverterOptions('', '')
@@ -51,60 +50,46 @@ class DataCollectionNode(Node):
         self.writer = SequentialWriter()
         self.writer.open(storage_options, converter_options)
         
-        # Define topics metadata
-        ackermann_topic = TopicMetadata(
-            name='Ackermann',
-            type='ackermann_msgs/msg/AckermannDriveStamped',
-            serialization_format='cdr'
-        )
+        # Register topics
+        topics = [
+            TopicMetadata(name='cmd_vel', type='geometry_msgs/msg/Twist', serialization_format='cdr'),
+            TopicMetadata(name='odom', type='nav_msgs/msg/Odometry', serialization_format='cdr'),
+            TopicMetadata(name='scan', type='sensor_msgs/msg/LaserScan', serialization_format='cdr')
+        ]
         
-        lidar_topic = TopicMetadata(
-            name='Lidar',
-            type='sensor_msgs/msg/LaserScan',
-            serialization_format='cdr'
-        )
-        
-        self.writer.create_topic(ackermann_topic)
-        self.writer.create_topic(lidar_topic)
+        for topic in topics:
+            self.writer.create_topic(topic)
+        self.get_logger().info('Recording STARTED! Saving data to sim_Dataset/testrun')
 
-    def sync_callback(self, ack_msg, ldr_msg):
-        if self.pressed and self.writer:
-            try:
-                self.writer.write(
-                    'Ackermann',
-                    serialize_message(ack_msg),
-                    self.get_clock().now().nanoseconds
-                )
-                self.writer.write(
-                    'Lidar',
-                    serialize_message(ldr_msg),
-                    self.get_clock().now().nanoseconds
-                )
-            except Exception as e:
-                self.get_logger().error(f'Bag write error: {str(e)}')
-
-    def button_callback(self, j):
-        if j.buttons[1] == 1 and not self.pressed:
-            self.pressed = True
-            self.init_bag_writer()
-            self.get_logger().info('Recording Started')
-        elif j.buttons[1] == 0 and self.pressed:
-            self.pressed = False
-            self.writer.close()
-            self.get_logger().info('Recording Stopped')
+    def sensor_callback(self, cmd_msg, odom_msg, scan_msg):
+        try:
+            timestamp = self.get_clock().now().nanoseconds
+            self.writer.write('cmd_vel', serialize_message(cmd_msg), timestamp)
+            self.writer.write('odom', serialize_message(odom_msg), timestamp)
+            self.writer.write('scan', serialize_message(scan_msg), timestamp)
+            
+            # Update counter and print status every 10 messages
+            self.msg_counter += 1
+            if self.msg_counter % 10 == 0:
+                self.get_logger().info(f'Writing data... ({self.msg_counter} messages recorded)')
+                
+        except Exception as e:
+            self.get_logger().error(f'Recording error: {str(e)}')
 
 def main(args=None):
     rclpy.init(args=args)
-    node = DataCollectionNode()
+    collector = DataCollectionNode()
     
     try:
-        rclpy.spin(node)
+        collector.get_logger().info('Starting data collection...')
+        rclpy.spin(collector)
     except KeyboardInterrupt:
-        pass
+        collector.get_logger().info('Keyboard interrupt received')
     finally:
-        if node.writer:
-            node.writer.close()
-        node.destroy_node()
+        if collector.writer:
+            collector.writer.close()
+        collector.get_logger().info(f'Recording COMPLETE! Total messages: {collector.msg_counter}')
+        collector.destroy_node()
         rclpy.shutdown()
 
 if __name__ == '__main__':
