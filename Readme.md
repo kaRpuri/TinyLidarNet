@@ -22,7 +22,7 @@
 
 ```bash
 git clone https://github.com/kaRpuri/TinyLidarNet.git
-cd Multi-Modal-TinyLidarNet
+cd TinyLidarNet
 ```
 
 ### 2. Create the Conda Environment
