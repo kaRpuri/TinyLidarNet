@@ -29,6 +29,8 @@ cd TinyLidarNet
 
 ```bash
 conda env create -f environment.yml
+conda install pip
+which pip   # make sure that you are using the correct pip
 conda activate tln
 ```
 
