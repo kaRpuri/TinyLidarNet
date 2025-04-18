@@ -21,7 +21,7 @@
 ### 1. Clone the Repository
 
 ```bash
-git clone <your-repo-url> Multi-Modal-TinyLidarNet
+git clone https://github.com/kaRpuri/TinyLidarNet.git
 cd Multi-Modal-TinyLidarNet
 ```
 
