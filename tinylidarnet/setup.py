@@ -11,16 +11,24 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
     ],
-    install_requires=['setuptools'],
+    install_requires=[
+        'setuptools',
+        'numpy',
+        'tensorflow',
+        'matplotlib',
+        'scikit-learn',
+        # 'rosbag2_py',  # Only if available via pip, otherwise install via ROS2 tools
+    ],
     zip_safe=True,
-    maintainer='zzangupenn, Hongrui Zheng',
-    maintainer_email='zzang@seas.upenn.edu, billyzheng.bz@gmail.com',
     description='tinylidarnet',
     license='MIT',
+    maintainer='kaRpuri',
+    maintainer_email='kapuri@seas.upenn.edu',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'tinylidarnet = tinylidarnet.tinylidarnet:main',
+            # Add other scripts as needed
         ],
     },
 )
