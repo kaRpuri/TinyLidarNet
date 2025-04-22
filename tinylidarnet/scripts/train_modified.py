@@ -1,50 +1,91 @@
 #!/usr/bin/env python3
 import os
 import time
+import warnings
 import numpy as np
-import rosbag
-from sklearn.utils import shuffle
 import tensorflow as tf
-from tensorflow.keras.optimizers import Adam
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from sklearn.utils import shuffle
 
+# ROS 2 bag imports
+from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
+from rclpy.serialization import deserialize_message
+from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry
 
-def linear_map(x, x_min, x_max, y_min, y_max):
-    return (x - x_min) / (x_max - x_min) * (y_max - y_min) + y_min
-
-
-def huber_loss_np(y_true, y_pred, delta=1.0):
-    error = np.abs(y_true - y_pred)
-    loss = np.where(error <= delta, 0.5 * error**2, delta * (error - 0.5 * delta))
-    return np.mean(loss)
-
-
-def create_lidar_sequences(lidar_data, servo_data, speed_data, timestamps, sequence_length=5):
-    """
-    Build sliding-window sequences of LiDAR frames with time-delta features
-    and corresponding steering/speed targets.
-    """
-    X, y = [], []
-    for i in range(len(lidar_data) - sequence_length):
-        frames = np.stack(lidar_data[i:i + sequence_length], axis=0)
-        dt = np.diff(timestamps[i:i + sequence_length + 1]).reshape(sequence_length, 1)
-        seq = np.concatenate([frames, dt], axis=1)
-        X.append(seq)
-        y.append([servo_data[i + sequence_length], speed_data[i + sequence_length]])
-    return np.array(X), np.array(y)
-
+# Keras model imports
 from tensorflow.keras.layers import (
     Input, TimeDistributed, Conv1D, Flatten,
     Bidirectional, LSTM, Dense, Attention
 )
 from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
 
+#========================================================
+# Utility functions (from your first block)
+#========================================================
+def linear_map(x, x_min, x_max, y_min, y_max):
+    return (x - x_min) / (x_max - x_min) * (y_max - y_min) + y_min
 
+def read_ros2_bag(bag_path):
+    """
+    Reads a ROS 2 bag via rosbag2_py and returns
+    lidar scans, steering (angular.z), speeds (linear.x), and timestamps.
+    """
+    storage_opts = StorageOptions(uri=bag_path, storage_id='sqlite3')
+    conv_opts    = ConverterOptions(input_serialization_format='', output_serialization_format='')
+    reader = SequentialReader()
+    reader.open(storage_opts, conv_opts)
+
+    lidar_data, servo_data, speed_data, timestamps = [], [], [], []
+
+    while reader.has_next():
+        topic, serialized_msg, t_ns = reader.read_next()
+        # Convert nanoseconds to seconds
+        t = t_ns * 1e-9
+
+        if topic == 'scan':
+            msg = deserialize_message(serialized_msg, LaserScan)
+            cleaned = np.nan_to_num(msg.ranges, posinf=0.0, neginf=0.0)
+            lidar_data.append(cleaned[::2])
+            timestamps.append(t)
+
+        elif topic == 'odom':
+            msg = deserialize_message(serialized_msg, Odometry)
+            servo_data.append(msg.twist.twist.angular.z)
+            speed_data.append(msg.twist.twist.linear.x)
+            # align timestamp for control measurements too
+            # (you can choose to append t here or ignore if you only need LIDAR dt)
+            # timestamps.append(t)
+
+    return (
+        np.array(lidar_data),
+        np.array(servo_data),
+        np.array(speed_data),
+        np.array(timestamps)
+    )
+
+#========================================================
+# Sequence builder (unchanged)
+#========================================================
+def create_lidar_sequences(lidar_data, servo_data, speed_data, timestamps, sequence_length=5):
+    X, y = [], []
+    for i in range(len(lidar_data) - sequence_length):
+        frames = np.stack(lidar_data[i:i + sequence_length], axis=0)
+        dt     = np.diff(timestamps[i:i + sequence_length + 1]).reshape(sequence_length, 1)
+        seq    = np.concatenate([frames[..., None], dt[..., None]], axis=2)
+        X.append(seq)
+        y.append([servo_data[i + sequence_length], speed_data[i + sequence_length]])
+    return np.array(X), np.array(y)
+
+#========================================================
+# Model definition (RNN + Attention)
+#========================================================
 def build_spatiotemporal_model(seq_len, num_ranges):
-    inputs = Input(shape=(seq_len, num_ranges, 1), name='lidar_sequence')
-    x = TimeDistributed(Conv1D(24, 10, strides=4, activation='relu'))(inputs)
+    inp = Input(shape=(seq_len, num_ranges, 1), name='lidar_sequence')
+    x = TimeDistributed(Conv1D(24, 10, strides=4, activation='relu'))(inp)
     x = TimeDistributed(Conv1D(36, 8, strides=4, activation='relu'))(x)
     x = TimeDistributed(Conv1D(48, 4, strides=2, activation='relu'))(x)
     x = TimeDistributed(Flatten())(x)
@@ -54,91 +95,89 @@ def build_spatiotemporal_model(seq_len, num_ranges):
     v = Dense(64)(lstm_out)
     attn = Attention()([q, v, k])
     context = tf.reduce_mean(attn, axis=1)
-    outputs = Dense(2, activation='tanh', name='controls')(context)
-    return Model(inputs, outputs, name='RNN_Attention_Controller')
+    out = Dense(2, activation='tanh', name='controls')(context)
+    return Model(inp, out, name='RNN_Attention_Controller')
 
-
-def evaluate_tflite(model_path, X_data, y_data, seq_len, num_ranges):
-    interp = tf.lite.Interpreter(model_path=model_path)
-    interp.allocate_tensors()
-    inp_idx = interp.get_input_details()[0]['index']
-    out_idx = interp.get_output_details()[0]['index']
-    times, preds = [], []
-    for sample in X_data:
-        inp = sample.astype(np.float32).reshape(1, seq_len, num_ranges, 1)
-        t0 = time.time()
-        interp.set_tensor(inp_idx, inp)
-        interp.invoke()
-        out = interp.get_tensor(out_idx)[0]
-        times.append((time.time() - t0) * 1e6)
-        preds.append(out)
-    preds = np.array(preds)
-    print(f"TFLite Model: {os.path.basename(model_path)}")
-    print(" - Huber Loss:", huber_loss_np(y_data, preds))
-    print(" - Avg Inference Time (µs):", np.mean(times))
-    return preds, times
-
+#========================================================
+# Main
+#========================================================
 if __name__ == '__main__':
-    # Check GPU
-    gpus = tf.config.list_physical_devices('GPU')
-    print('GPU AVAILABLE:', bool(gpus))
+    # Check for GPU
+    print('GPU AVAILABLE:', bool(tf.config.list_physical_devices('GPU')))
 
-    bag_paths = ['./Dataset/out.bag', './Dataset/f2.bag', './Dataset/f4.bag']
-    seq_len = 5
+    # --- Parameters ---
+    bag_paths = [
+        '/home/nvidia/f1tenth_ws/src/TinyLidarNet/tinylidarnet/scripts/sim_Dataset/test_levine1/test_levine1_0.db3'
+    ]
+    seq_len    = 5
     batch_size = 64
-    lr = 5e-5
+    lr         = 5e-5
+    epochs     = 20
 
-    raw_lidar, raw_servo, raw_speed, timestamps = [], [], [], []
+    # --- Load & concatenate all bags ---
+    all_lidar, all_servo, all_speed, all_ts = [], [], [], []
     for pth in bag_paths:
-        if not os.path.exists(pth): raise FileNotFoundError(pth)
-        bag = rosbag.Bag(pth)
-        for topic, msg, t in bag.read_messages():
-            if topic == 'Lidar':
-                raw_lidar.append(np.array(msg.ranges)[::2])
-                timestamps.append(t.to_sec())
-            elif topic == 'Ackermann':
-                raw_servo.append(msg.drive.steering_angle)
-                raw_speed.append(msg.drive.speed)
-        bag.close()
+        l, s, sp, ts = read_ros2_bag(pth)
+        print(f'Loaded {len(l)} scans from {pth}')
+        all_lidar.extend(l)
+        all_servo.extend(s)
+        all_speed.extend(sp)
+        all_ts.extend(ts)
 
-    raw_speed = np.array(raw_speed)
-    min_s, max_s = raw_speed.min(), raw_speed.max()
-    raw_speed = linear_map(raw_speed, min_s, max_s, 0, 1)
-    raw_servo = np.array(raw_servo)
-    timestamps = np.array(timestamps)
+    all_lidar = np.array(all_lidar)
+    all_servo = np.array(all_servo)
+    all_speed = np.array(all_speed)
+    all_ts    = np.array(all_ts)
 
-    X, y = create_lidar_sequences(raw_lidar, raw_servo, raw_speed, timestamps, seq_len)
-    num_samples, _, num_ranges = X.shape
-    print(f"Total sequences: {num_samples}, num_ranges: {num_ranges}")
+    # Normalize speed 0→1
+    min_s, max_s = all_speed.min(), all_speed.max()
+    all_speed = linear_map(all_speed, min_s, max_s, 0, 1)
 
-    X, y = shuffle(X, y, random_state=62)
-    split = int(0.85 * num_samples)
+    # Build sequences
+    X, y = create_lidar_sequences(all_lidar, all_servo, all_speed, all_ts, seq_len)
+    n_samples, _, num_ranges, _ = X.shape
+    print(f'Total sequences: {n_samples}, ranges per scan: {num_ranges}')
+
+    # Shuffle and split
+    X, y = shuffle(X, y, random_state=42)
+    split = int(0.85 * n_samples)
     X_train, X_test = X[:split], X[split:]
     y_train, y_test = y[:split], y[split:]
-    X_train = X_train.reshape(-1, seq_len, num_ranges, 1)
-    X_test  = X_test.reshape(-1, seq_len, num_ranges, 1)
 
+    # Build & compile model
     model = build_spatiotemporal_model(seq_len, num_ranges)
     model.compile(optimizer=Adam(lr), loss='huber')
     print(model.summary())
 
-    for layer in model.layers:
-        if 'lstm' in layer.name or 'attention' in layer.name:
-            layer.trainable = False
-    model.fit(X_train, y_train, epochs=5, batch_size=batch_size,
+    # Train
+    start = time.time()
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_test, y_test),
+        epochs=epochs,
+        batch_size=batch_size
+    )
+    print(f'Training done in {int(time.time() - start)}s')
 
+    # Plot loss curve
+    plt.plot(history.history['loss'], label='Train')
+    plt.plot(history.history['val_loss'], label='Val')
+    plt.xlabel('Epoch'); plt.ylabel('Loss'); plt.legend()
+    plt.savefig('Figures/loss_curve.png')
+    plt.close()
 
-# how to train
-#         1.for layer in model.layers:
-#             if 'lstm' in layer.name or 'attention' in layer.name:
-#                 layer.trainable = False
-#   • Train on X_train (shape: [N, 5, num_ranges, 1]) to learn spatial features
-#
-# 2.3 frame window
-#         for layer in model.layers:
-#             layer.trainable = True
-#   train on X_train[:, :3] (shape: [N, 3, num_ranges, 1]) for LSTM+Attention 
+    # Convert & save TFLite
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.target_spec.supported_ops = [
+        tf.lite.OpsSet.TFLITE_BUILTINS,
+        tf.lite.OpsSet.SELECT_TF_OPS
+    ]
+    tflite_model = converter.convert()
+    os.makedirs('Models', exist_ok=True)
+    with open('Models/RNN_Attn_Controller.tflite', 'wb') as f:
+        f.write(tflite_model)
+    print('TFLite model saved.')
 
-
-#then
-#model.fit(X_train, y_train, …)
+    # Final evaluation
+    test_loss = model.evaluate(X_test, y_test, verbose=0)
+    print(f'Final test loss: {test_loss:.4f}')
