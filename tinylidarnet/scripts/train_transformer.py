@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
+"""
+train_transformer.py
+
+Advanced Transformer-based spatio-temporal LiDAR→controls training:
+- Sinusoidal positional embeddings
+- [CLS] token pooling (custom Keras layer)
+- Stacked Transformer encoder blocks (pre-norm)
+- Warmup + cosine decay learning rate schedule
+- Gradient clipping, dropout, LayerNorm
+- Auxiliary time-to-collision head
+"""
+
 import os
 import time
-import warnings
 import numpy as np
 import tensorflow as tf
 import matplotlib
@@ -12,200 +23,225 @@ from sklearn.utils import shuffle
 # ROS 2 bag imports
 from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
 from rclpy.serialization import deserialize_message
-from sensor_msgs.msg import LaserScan, Odometry
+from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry
 
-# Keras model imports
+# Keras imports
 from tensorflow.keras.layers import (
     Input, TimeDistributed, Conv1D, Flatten,
     BatchNormalization, Dropout,
-    Dense, MultiHeadAttention,
-    LayerNormalization, GlobalAveragePooling1D, Add
+    Dense, MultiHeadAttention, LayerNormalization,
+    GlobalAveragePooling1D, Embedding, Layer
 )
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping, LearningRateScheduler
+from tensorflow.keras.callbacks import EarlyStopping
 
 #========================================================
-# Utility functions
+# Positional encoding utilities
 #========================================================
-def linear_map(x, x_min, x_max, y_min, y_max):
-    return (x - x_min) / (x_max - x_min) * (y_max - y_min) + y_min
+def sinusoidal_positional_encoding(seq_len, d_model):
+    pos = np.arange(seq_len)[:, None]
+    i   = np.arange(d_model)[None, :]
+    angle = pos / np.power(10000, (2 * (i//2)) / d_model)
+    pe = np.zeros((seq_len, d_model))
+    pe[:, 0::2] = np.sin(angle[:, 0::2])
+    pe[:, 1::2] = np.cos(angle[:, 1::2])
+    return tf.constant(pe, dtype=tf.float32)
 
+#========================================================
+# Custom [CLS] token layer
+#========================================================
+class CLSToken(Layer):
+    def __init__(self, d_model, **kwargs):
+        super().__init__(**kwargs)
+        self.d_model = d_model
+
+    def build(self, input_shape):
+        # input_shape: (batch, seq_len, d_model)
+        self.cls = self.add_weight(
+            shape=(1, 1, self.d_model),
+            initializer='zeros',
+            trainable=True,
+            name='cls_token'
+        )
+    def call(self, inputs):
+        # inputs: (batch, seq_len, d_model)
+        batch = tf.shape(inputs)[0]
+        return tf.tile(self.cls, [batch, 1, 1])
+
+#========================================================
+# Transformer block (pre-norm)
+#========================================================
+def transformer_block(x, d_model, num_heads, ff_dim, dropout_rate=0.1):
+    # Pre-norm
+    y    = LayerNormalization(epsilon=1e-6)(x)
+    attn = MultiHeadAttention(num_heads=num_heads, key_dim=d_model)(y, y, y)
+    attn = Dropout(dropout_rate)(attn)
+    x1   = x + attn
+
+    y1  = LayerNormalization(epsilon=1e-6)(x1)
+    ff  = Dense(ff_dim, activation='relu')(y1)
+    ff  = Dense(d_model)(ff)
+    ff  = Dropout(dropout_rate)(ff)
+    x2  = x1 + ff
+    return x2
+
+#========================================================
+# Read and build sequences
+#========================================================
 def read_ros2_bag(bag_path):
-    """
-    Reads a ROS 2 bag via rosbag2_py and returns:
-    lidar_data: [N, num_ranges]
-    servo_data: [N]
-    speed_data: [N]
-    timestamps: [N]
-    """
     storage_opts = StorageOptions(uri=bag_path, storage_id='sqlite3')
     conv_opts    = ConverterOptions(input_serialization_format='', output_serialization_format='')
-    reader = SequentialReader()
-    reader.open(storage_opts, conv_opts)
-
-    lidar_data, servo_data, speed_data, timestamps = [], [], [], []
-
+    reader = SequentialReader(); reader.open(storage_opts, conv_opts)
+    lidar, servo, speed, ts = [], [], [], []
     while reader.has_next():
-        topic, serialized_msg, t_ns = reader.read_next()
-        t = t_ns * 1e-9  # nanoseconds to seconds
+        topic, data, t_ns = reader.read_next()
+        t = t_ns * 1e-9
         if topic == 'scan':
-            msg = deserialize_message(serialized_msg, LaserScan)
+            msg = deserialize_message(data, LaserScan)
             cleaned = np.nan_to_num(msg.ranges, posinf=0.0, neginf=0.0)
-            lidar_data.append(cleaned[::2])   # subsample by 2
-            timestamps.append(t)
+            lidar.append(cleaned[::2]); ts.append(t)
         elif topic == 'odom':
-            msg = deserialize_message(serialized_msg, Odometry)
-            servo_data.append(msg.twist.twist.angular.z)
-            speed_data.append(msg.twist.twist.linear.x)
+            msg = deserialize_message(data, Odometry)
+            servo.append(msg.twist.twist.angular.z)
+            speed.append(msg.twist.twist.linear.x)
+    return np.array(lidar), np.array(servo), np.array(speed), np.array(ts)
 
-    return (
-        np.array(lidar_data),
-        np.array(servo_data),
-        np.array(speed_data),
-        np.array(timestamps)
-    )
-
-def create_lidar_sequences(lidar_data, servo_data, speed_data, timestamps, sequence_length=5):
-    """
-    Build sequences of shape (seq_len, num_ranges, 2):
-    channels: [ranges, Δt].
-    """
-    X, y = [], []
-    num_ranges = lidar_data.shape[1]
-    for i in range(len(lidar_data) - sequence_length):
-        frames = np.stack(lidar_data[i:i+sequence_length], axis=0)  # (seq_len, num_ranges)
-        dt = np.diff(timestamps[i:i+sequence_length+1]).reshape(sequence_length, 1)  # (seq_len,1)
-        dt_tiled = np.repeat(dt, num_ranges, axis=1)  # (seq_len, num_ranges)
-        seq = np.concatenate([frames[...,None], dt_tiled[...,None]], axis=2)  # (seq_len, num_ranges,2)
+def create_lidar_sequences(lidar, servo, speed, ts, seq_len=5):
+    X, y, y_ttc = [], [], []
+    num_ranges = lidar.shape[1]
+    for i in range(len(lidar)-seq_len):
+        frames = np.stack(lidar[i:i+seq_len], axis=0)
+        dt = np.diff(ts[i:i+seq_len+1]).reshape(seq_len,1)
+        dt_tiled = np.repeat(dt, num_ranges, axis=1)
+        seq = np.concatenate([frames[...,None], dt_tiled[...,None]], axis=2)
         X.append(seq)
-        y.append([servo_data[i+sequence_length], speed_data[i+sequence_length]])
-    return np.array(X), np.array(y)
+        y.append([servo[i+seq_len], speed[i+seq_len]])
+        y_ttc.append(np.min(frames[-1]))
+    return np.array(X), np.array(y), np.array(y_ttc)
 
 #========================================================
-# Transformer-based model
+# Model builder
 #========================================================
-def build_transformer_model(seq_len, num_ranges, d_model=128, num_heads=4, ff_dim=256):
-    """
-    - added learnable positional embeddings
-    """
-    # Input: (batch, seq_len, num_ranges, 2)
-    inp = Input(shape=(seq_len, num_ranges, 2), name='lidar_sequence')
-
-    x = TimeDistributed(Conv1D(24, 10, strides=4, activation='relu'))(inp)
+def build_advanced_transformer(seq_len, num_ranges,
+                               d_model=256, num_heads=8,
+                               ff_dim=512, num_layers=4,
+                               dropout_rate=0.1, aux_ttc=False):
+    inp = Input((seq_len, num_ranges, 2), name='lidar_seq')
+    # Conv backbone per frame
+    x = TimeDistributed(Conv1D(32,10, strides=4, activation='relu'))(inp)
     x = TimeDistributed(BatchNormalization())(x)
     x = TimeDistributed(Dropout(0.2))(x)
-
-    x = TimeDistributed(Conv1D(36, 8, strides=4, activation='relu'))(x)
+    x = TimeDistributed(Conv1D(64,8, strides=4, activation='relu'))(x)
     x = TimeDistributed(BatchNormalization())(x)
     x = TimeDistributed(Dropout(0.2))(x)
-
-    x = TimeDistributed(Conv1D(48, 4, strides=2, activation='relu'))(x)
+    x = TimeDistributed(Conv1D(128,4, strides=2, activation='relu'))(x)
     x = TimeDistributed(BatchNormalization())(x)
+    x = TimeDistributed(Flatten())(x)  # (batch, seq_len, feat_dim)
 
-    x = TimeDistributed(Flatten())(x) 
+    # Project to d_model
+    proj = TimeDistributed(Dense(d_model))(x)
 
-    proj = TimeDistributed(Dense(d_model))(x)  # (batch, seq_len, d_model)
+    # CLS token layer
+    cls_tok = CLSToken(d_model)(proj)
 
-    pos_emb = tf.Variable(tf.random.normal([seq_len, d_model]),
-                          trainable=True, name='pos_emb')
-    x2 = Add()([proj, pos_emb])
+    # Positional encodings
+    pe = sinusoidal_positional_encoding(seq_len, d_model)[None,...]
+    pos = proj + pe
 
-    attn_out = MultiHeadAttention(num_heads=num_heads, key_dim=d_model)(
-        x2, x2, x2
-    )
-    x3 = Add()([x2, attn_out])
-    x3 = LayerNormalization()(x3)
+    # Concat CLS + pos
+    x2 = tf.keras.layers.Concatenate(axis=1)([cls_tok, pos])  # (batch, seq_len+1, d_model)
 
-    ff = Dense(ff_dim, activation='relu')(x3)
-    ff = Dense(d_model)(ff)
-    x4 = Add()([x3, ff])
-    x4 = LayerNormalization()(x4)
+    # Stacked transformer blocks
+    for _ in range(num_layers):
+        x2 = transformer_block(x2, d_model, num_heads, ff_dim, dropout_rate)
 
-    context = GlobalAveragePooling1D()(x4)
-    context = Dropout(0.3)(context)
+    # CLS output
+    cls_out = x2[:,0,:]
+    ctrl    = Dense(2, activation='tanh', name='controls')(cls_out)
 
-    out = Dense(2, activation='tanh', name='controls')(context)
-    return Model(inp, out, name='Transformer_Controller')
+    if aux_ttc:
+        ttc = Dense(1, activation='relu', name='time_to_collision')(cls_out)
+        return Model(inp, [ctrl, ttc], name='AdvTransformer')
 
-initial_lr = 5e-5
-def lr_schedule(epoch):
-    return initial_lr if epoch < 10 else initial_lr * 0.1
+    return Model(inp, ctrl, name='AdvTransformer')
 
-if __name__ == '__main__':
-    print('GPU AVAILABLE:', bool(tf.config.list_physical_devices('GPU')))
+class WarmupCosine(tf.keras.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, base_lr, warmup_steps, total_steps):
+        super().__init__()
+        self.base = base_lr
+        self.warmup = tf.cast(warmup_steps, tf.float32)
+        self.total = tf.cast(total_steps, tf.float32)
 
-    # Paths & hyperparameters
+    def __call__(self, step):
+        # cast step to float32
+        s = tf.cast(step, tf.float32)
+        # linear warmup: base_lr * (s / warmup)
+        warmup_lr = self.base * (s / self.warmup)
+        # cosine decay: 0.5*base*(1 + cos(pi * (s - warmup)/(total-warmup)))
+        progress = (s - self.warmup) / (self.total - self.warmup)
+        cosine_lr = 0.5 * self.base * (1 + tf.cos(np.pi * progress))
+        # if s < warmup → warmup_lr else → cosine_lr
+        return tf.where(s < self.warmup, warmup_lr, cosine_lr)
+
+
+#========================================================
+# Main training routine
+#========================================================
+if __name__=='__main__':
+    print("GPU AVAILABLE:", tf.config.list_physical_devices('GPU'))
+
     bag_paths = [
-        '/home/nvidia/f1tenth_ws/src/TinyLidarNet/tinylidarnet/scripts/sim_Dataset/test_levine1/test_levine1_0.db3'
+        '/home/shirin/lab_ws/TinyLidarNet/tinylidarnet/scripts/sim_Dataset/test_levine1/test_levine1_0.db3'
     ]
-    seq_len, batch_size, epochs = 5, 64, 20
+    seq_len, batch_size, epochs = 5, 64, 30
 
-    # Load and aggregate data
-    all_lidar, all_servo, all_speed, all_ts = [], [], [], []
+    lidar, servo, speed, ts = [],[],[],[]
     for p in bag_paths:
-        l, s, sp, ts = read_ros2_bag(p)
-        print(f'Loaded {len(l)} scans from {p}')
-        all_lidar.extend(l); all_servo.extend(s)
-        all_speed.extend(sp); all_ts.extend(ts)
-    all_lidar = np.array(all_lidar)
-    all_servo = np.array(all_servo)
-    all_speed = np.array(all_speed)
-    all_ts = np.array(all_ts)
+        l,s,sp,t = read_ros2_bag(p)
+        lidar.extend(l); servo.extend(s); speed.extend(sp); ts.extend(t)
+    lidar, servo, speed, ts = map(np.array, (lidar, servo, speed, ts))
 
-    vmin, vmax = all_speed.min(), all_speed.max()
-    all_speed = linear_map(all_speed, vmin, vmax, 0, 1)
+    # Normalize speed
+    vmin, vmax = speed.min(), speed.max()
+    speed = (speed-vmin)/(vmax-vmin)
 
-    X, y = create_lidar_sequences(all_lidar, all_servo, all_speed, all_ts, seq_len)
-    n, _, num_ranges, _ = X.shape
-    print(f'Total sequences: {n}, ranges per scan: {num_ranges}')
+    # Build sequences
+    X, y, y_ttc = create_lidar_sequences(lidar, servo, speed, ts, seq_len)
+    n = X.shape[0]
+    X, y, y_ttc = shuffle(X,y,y_ttc, random_state=42)
+    split = int(0.85*n)
+    Xtr, Xte = X[:split], X[split:]
+    ytr, yte = y[:split], y[split:]
+    ttctr, ttcte = y_ttc[:split], y_ttc[split:]
 
-    X, y = shuffle(X, y, random_state=42)
-    split = int(0.85 * n)
-    X_train, X_test = X[:split], X[split:]
-    y_train, y_test = y[:split], y[split:]
-
-    model = build_transformer_model(seq_len, num_ranges,
-                                    d_model=128, num_heads=4, ff_dim=256)
-    optimizer = Adam(initial_lr)
-    model.compile(optimizer=optimizer, loss='huber')
-    print(model.summary())
-
-    callbacks = [
-        EarlyStopping(patience=5, restore_best_weights=True),
-        LearningRateScheduler(lr_schedule)
-    ]
-
-    t0 = time.time()
-    hist = model.fit(
-        X_train, y_train,
-        validation_data=(X_test, y_test),
-        epochs=epochs,
-        batch_size=batch_size,
-        callbacks=callbacks
+    # Instantiate model
+    model = build_advanced_transformer(seq_len, X.shape[2], aux_ttc=True)
+    total_steps = (n//batch_size)*epochs
+    lr_sched = WarmupCosine(1e-4, 500, total_steps)
+    opt = Adam(learning_rate=lr_sched, clipnorm=1.0)
+    model.compile(
+        optimizer=opt,
+        loss={'controls':'huber','time_to_collision':'mse'},
+        loss_weights={'controls':1.0,'time_to_collision':0.5}
     )
-    print(f'Training completed in {int(time.time() - t0)}s')
+    model.summary()
 
-    # Plot loss curve
-    plt.plot(hist.history['loss'], label='Train')
-    plt.plot(hist.history['val_loss'], label='Val')
-    plt.xlabel('Epoch'); plt.ylabel('Loss'); plt.legend()
-    plt.savefig('Figures/loss_curve.png')
-    plt.close()
+    cb = [EarlyStopping(patience=5, restore_best_weights=True)]
+    hist = model.fit(
+        Xtr, {'controls':ytr,'time_to_collision':ttctr},
+        validation_data=(Xte,{'controls':yte,'time_to_collision':ttcte}),
+        epochs=epochs, batch_size=batch_size, callbacks=cb
+    )
+    print("Training time:", time.time()-t0)
 
-    # Convert to TFLite
+    plt.plot(hist.history['loss'],label='train')
+    plt.plot(hist.history['val_loss'],label='val')
+    plt.legend(); plt.savefig('loss_curve.png')
+
     converter = tf.lite.TFLiteConverter.from_keras_model(model)
-    converter.target_spec.supported_ops = [
-        tf.lite.OpsSet.TFLITE_BUILTINS,
-        tf.lite.OpsSet.SELECT_TF_OPS
-    ]
+    converter.target_spec.supported_ops=[tf.lite.OpsSet.TFLITE_BUILTINS]
     tflite_model = converter.convert()
-    os.makedirs('Models', exist_ok=True)
-    with open('Models/Transformer_Controller.tflite', 'wb') as f:
-        f.write(tflite_model)
-    print('TFLite model saved: Models/Transformer_Controller.tflite')
-
-    # Evaluate final test loss
-    loss = model.evaluate(X_test, y_test, verbose=0)
-    print(f'Final test loss: {loss:.4f}')
-
+    open('adv_transformer.tflite','wb').write(tflite_model)
+    print("Saved TFLite model")
