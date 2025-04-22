@@ -2,29 +2,29 @@ rosbag2_bagfile_information:
   version: 5
   storage_identifier: sqlite3
   duration:
-    nanoseconds: 116523863553
+    nanoseconds: 197256011327
   starting_time:
-    nanoseconds_since_epoch: 1745003544271740196
-  message_count: 9093
+    nanoseconds_since_epoch: 1745286377530694068
+  message_count: 14451
   topics_with_message_count:
     - topic_metadata:
         name: scan
         type: sensor_msgs/msg/LaserScan
         serialization_format: cdr
         offered_qos_profiles: ""
-      message_count: 3031
+      message_count: 4817
     - topic_metadata:
         name: odom
         type: nav_msgs/msg/Odometry
         serialization_format: cdr
         offered_qos_profiles: ""
-      message_count: 3031
+      message_count: 4817
     - topic_metadata:
         name: cmd_vel
         type: geometry_msgs/msg/Twist
         serialization_format: cdr
         offered_qos_profiles: ""
-      message_count: 3031
+      message_count: 4817
   compression_format: ""
   compression_mode: ""
   relative_file_paths:
@@ -32,7 +32,7 @@ rosbag2_bagfile_information:
   files:
     - path: testrun3_0.db3
       starting_time:
-        nanoseconds_since_epoch: 1745003544271740196
+        nanoseconds_since_epoch: 1745286377530694068
       duration:
-        nanoseconds: 116523863553
-      message_count: 9093
+        nanoseconds: 197256011327
+      message_count: 14451

@@ -59,7 +59,7 @@ def read_ros2_bag(bag_path):
 if __name__ == "__main__":
     # Configuration
     model_name = 'TLN'
-    dataset_path = ['./sim_Dataset/testrun/testrun_0.db3', './sim_Dataset/testrun1/testrun1_0.db3', './sim_Dataset/testrun3/testrun3_0.db3']
+    dataset_path = ['./sim_Dataset/testrun3/testrun3_0.db3']
     down_sample_param = 2
     lr = 5e-5
     batch_size = 64

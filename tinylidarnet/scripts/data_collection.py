@@ -11,25 +11,25 @@ from nav_msgs.msg import Odometry
 class DataCollectionNode(Node):
     def __init__(self):
         super().__init__('sim_data_collector')
-        self.msg_counter = 0  # Add message counter
+        self.msg_counter = 0
         
-        # Initialize bag writer immediately
+        # Initialize bag writer
         self.writer = None
         self.init_bag_writer()
         
-        # Configure QoS for sensor data
+        # QoS for sensor data
         sensor_qos = QoSProfile(
             depth=20,
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE
         )
         
-        # Initialize synchronized subscribers
+        # Subscribers
         self.drive_sub = message_filters.Subscriber(self, Twist, '/cmd_vel')
         self.odom_sub = message_filters.Subscriber(self, Odometry, '/ego_racecar/odom')
         self.lidar_sub = message_filters.Subscriber(self, LaserScan, '/scan', qos_profile=sensor_qos)
         
-        # Setup time synchronizer
+        # Synchronizer
         self.ts = message_filters.ApproximateTimeSynchronizer(
             [self.drive_sub, self.odom_sub, self.lidar_sub],
             queue_size=15,
@@ -42,7 +42,7 @@ class DataCollectionNode(Node):
 
     def init_bag_writer(self):
         storage_options = StorageOptions(
-            uri='sim_Dataset/testrun2',
+            uri='sim_Dataset/testrun3',
             storage_id='sqlite3'
         )
         converter_options = ConverterOptions('', '')
@@ -59,7 +59,7 @@ class DataCollectionNode(Node):
         
         for topic in topics:
             self.writer.create_topic(topic)
-        self.get_logger().info('Recording STARTED! Saving data to sim_Dataset/testrun')
+        self.get_logger().info('Recording STARTED! Saving data to sim_Dataset/testrun3')
 
     def sensor_callback(self, cmd_msg, odom_msg, scan_msg):
         try:
@@ -67,6 +67,11 @@ class DataCollectionNode(Node):
             self.writer.write('cmd_vel', serialize_message(cmd_msg), timestamp)
             self.writer.write('odom', serialize_message(odom_msg), timestamp)
             self.writer.write('scan', serialize_message(scan_msg), timestamp)
+            
+            # Log position for verification
+            x = odom_msg.pose.pose.position.x
+            y = odom_msg.pose.pose.position.y
+            self.get_logger().debug(f'Position: x={x:.2f}, y={y:.2f}')
             
             # Update counter and print status every 10 messages
             self.msg_counter += 1
