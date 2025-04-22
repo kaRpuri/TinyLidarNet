@@ -168,14 +168,14 @@ if __name__ == '__main__':
     print(model.summary())
 
     # Train
-    start = time.time()
+    t0 = time.time()
     history = model.fit(
         X_train, y_train,
         validation_data=(X_test, y_test),
         epochs=epochs,
         batch_size=batch_size
     )
-    print(f'Training done in {int(time.time() - start)}s')
+    print(f'Training done in {int(time.time() - t0)}s')
 
     # Plot loss curve
     plt.plot(history.history['loss'], label='Train')
