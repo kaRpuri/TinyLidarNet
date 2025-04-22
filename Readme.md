@@ -1,4 +1,5 @@
-# F1tenth Project Team 10
+# Multi-Modal TLN_ROS2
+
 
 [![Read Paper](https://img.shields.io/badge/Read-Paper-blue)](Link_to_Paper)
 [![View Slides](https://img.shields.io/badge/View-Slides-green)](Link_to_Slides)
