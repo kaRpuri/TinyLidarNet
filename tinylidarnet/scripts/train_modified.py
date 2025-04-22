@@ -71,14 +71,34 @@ def read_ros2_bag(bag_path):
 # Sequence builder (unchanged)
 #========================================================
 def create_lidar_sequences(lidar_data, servo_data, speed_data, timestamps, sequence_length=5):
+    """
+    Build sliding-window sequences of LiDAR frames with time-delta features
+    and corresponding steering/speed targets.
+    """
     X, y = [], []
+    num_ranges = lidar_data.shape[1]
+
     for i in range(len(lidar_data) - sequence_length):
-        frames = np.stack(lidar_data[i:i + sequence_length], axis=0)
-        dt     = np.diff(timestamps[i:i + sequence_length + 1]).reshape(sequence_length, 1)
-        seq    = np.concatenate([frames[..., None], dt[..., None]], axis=2)
+        # stack the raw scans [seq_len x num_ranges]
+        frames = np.stack(lidar_data[i : i + sequence_length], axis=0)  # (seq_len, num_ranges)
+
+        # compute deltas dt between frames, shape (seq_len, 1)
+        dt = np.diff(timestamps[i : i + sequence_length + 1]).reshape(sequence_length, 1)
+
+        # replicate dt across all range bins: becomes (seq_len, num_ranges)
+        dt_tiled = np.repeat(dt, num_ranges, axis=1)
+
+        # now stack channels: (seq_len, num_ranges, 2)
+        seq = np.concatenate([
+            frames[..., None],      # (seq_len, num_ranges, 1)
+            dt_tiled[..., None]     # (seq_len, num_ranges, 1)
+        ], axis=2)
+
         X.append(seq)
         y.append([servo_data[i + sequence_length], speed_data[i + sequence_length]])
+
     return np.array(X), np.array(y)
+
 
 #========================================================
 # Model definition (RNN + Attention)
