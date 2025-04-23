@@ -12,8 +12,16 @@ from geometry_msgs.msg import PoseStamped
 
 
 class DataCollectionNode(Node):
+
+    STOP_AFTER_SEC = 600 #time in sec 
+
     def __init__(self):
         super().__init__('sim_data_collector')
+
+        #Time flag 
+        self.start_time = self.get_clock().now()
+        self.recording_active = True
+
         self.msg_counter = 0  # Add message counter
         
         # Initialize bag writer immediately
@@ -28,34 +36,29 @@ class DataCollectionNode(Node):
         )
         
         # Initialize synchronized subscribers
-        #self.drive_sub = message_filters.Subscriber(self, AckermannDriveStamped, "/drive")
-        #self.drive_sub = message_filters.Subscriber(self, Twist, '/cmd_vel')
-        # self.odom_sub = message_filters.Subscriber(self, Odometry, '/odom')
-        self.odom_sub = message_filters.Subscriber(self, Odometry, '/pf/pose/odom')
+        self.odom_sub = message_filters.Subscriber(self, Odometry, '/odom') #/pf/pose/odom' doesn't record the steering angle ()
+        self.odom_pf_sub = message_filters.Subscriber(self, Odometry, '/pf/pose/odom') 
         self.lidar_sub = message_filters.Subscriber(self, LaserScan, '/scan', qos_profile=sensor_qos)
-        
         self.imu_sub = message_filters.Subscriber(self, Imu, '/sensors/imu/raw')
         self.position_sub = message_filters.Subscriber(self, PoseStamped, '/pf/viz/inferred_pose')
 
         # Setup time synchronizer
         self.ts = message_filters.ApproximateTimeSynchronizer(
-            #[self.drive_sub, self.odom_sub, self.lidar_sub],
-            [self.odom_sub, self.lidar_sub, self.imu_sub, self.position_sub],
-            #[self.odom_sub, self.lidar_sub],
-            #[self.lidar_sub],
-            #[self.drive_sub],
-            #[self.odom_sub],
+            [self.odom_sub, self.odom_pf_sub, self.lidar_sub, self.imu_sub, self.position_sub],
             queue_size=20,
             slop=0.05,
             allow_headerless=True
         )
         self.ts.registerCallback(self.sensor_callback)
+
+        #Check every sec if 10 min have elapsed
+        self.stop_timer = self.create_timer(1.0, self._check_time)
         
         self.get_logger().info('Data collector node initialized!')
 
     def init_bag_writer(self):
         storage_options = StorageOptions(
-            uri='sim_Dataset/test_levine2',
+            uri='car_Dataset/pure_pursuit_fast_10',
             storage_id='sqlite3'
         )
         converter_options = ConverterOptions('', '')
@@ -67,6 +70,7 @@ class DataCollectionNode(Node):
         topics = [
             #TopicMetadata(name='cmd_vel', type='geometry_msgs/msg/Twist', serialization_format='cdr'),
             TopicMetadata(name='odom', type='nav_msgs/msg/Odometry', serialization_format='cdr'),
+            TopicMetadata(name='pf_odom', type='nav_msgs/msg/Odometry', serialization_format='cdr'),
             TopicMetadata(name='scan', type='sensor_msgs/msg/LaserScan', serialization_format='cdr'),
             TopicMetadata(name='pose', type='geometry_msgs/msg/PoseStamped', serialization_format='cdr'),
             TopicMetadata(name='imu', type='sensor_msgs/msg/Imu', serialization_format='cdr')
@@ -78,15 +82,16 @@ class DataCollectionNode(Node):
             self.writer.create_topic(topic)
         self.get_logger().info('Recording STARTED! Saving data to sim_Dataset/testrun')
 
-    #def sensor_callback(self, cmd_msg, odom_msg, scan_msg):
-    def sensor_callback(self, odom_msg, scan_msg, pose_msg, imu_msg):
-    #def sensor_callback(self, scan_msg):
-    #def sensor_callback(self, cmd_msg):
+    def sensor_callback(self, odom_msg, odom_pf_msg, scan_msg, pose_msg, imu_msg):
+
+        if not self.recording_active:
+            return #ignore once stopped
+
         try:
             timestamp = self.get_clock().now().nanoseconds
-            #self.writer.write('drive', serialize_message(cmd_msg), timestamp)
-            #self.writer.write('cmd_vel', serialize_message(cmd_msg), timestamp)
+            
             self.writer.write('odom', serialize_message(odom_msg), timestamp)
+            self.writer.write('pf_odom', serialize_message(odom_pf_msg), timestamp)
             self.writer.write('scan', serialize_message(scan_msg), timestamp)
             self.writer.write('pose', serialize_message(pose_msg), timestamp)
             self.writer.write('imu', serialize_message(imu_msg), timestamp)
@@ -98,6 +103,26 @@ class DataCollectionNode(Node):
                 
         except Exception as e:
             self.get_logger().error(f'Recording error: {str(e)}')
+
+
+
+##############################################################################
+    def _check_time(self):
+        elapsed_sec = (self.get_clock().now() - self.start_time).nanoseconds * 1e-9
+        if self.recording_active and elapsed_sec >= self.STOP_AFTER_SEC:
+            self._stop_recording()
+
+    def _stop_recording(self):
+        self.recording_active = False
+        self.writer.close()
+        self.get_logger().info(f'Recording stopped after the time selected')
+        self.destroy_node()
+        rclpy.shutdown()
+
+    def close(self):
+        if self.recording_active:
+            self._stop_recording()
+###########################################################
 
 def main(args=None):
     rclpy.init(args=args)
