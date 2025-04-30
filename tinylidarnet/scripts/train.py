@@ -67,8 +67,8 @@ def read_ros2_bag(bag_path):
 #========================================================
 if __name__ == "__main__":
     # Configuration
-    model_name = 'TLN'
-    dataset_path = ['/home/nvidia/f1tenth_ws/src/TinyLidarNet/tinylidarnet/scripts/car_Dataset/controller_slow_5min/controller_slow_5min_0.db3']
+    model_name = 'TLN' 
+    dataset_path = ['/home/nvidia/f1tenth_ws/src/TinyLidarNet/tinylidarnet/scripts/car_Dataset/controller_slow_5min/controller_slow_5min_0.db3', '/home/nvidia/f1tenth_ws/src/TinyLidarNet/tinylidarnet/scripts/car_Dataset/controller_slow_10min/controller_slow_10.db3']
     down_sample_param = 2
     lr = 5e-5
     batch_size = 64
@@ -161,7 +161,7 @@ if __name__ == "__main__":
     plt.title('Model Loss')
     plt.ylabel('Loss')
     plt.xlabel('Epoch')
-    plt.legend(['Train', 'Test'], loc='upper left')
+    plt.legend(['Train', 'Val'], loc='upper left')
     plt.savefig('./Figures/loss_curve.png')
     plt.close()
 
@@ -177,7 +177,7 @@ if __name__ == "__main__":
     ]
     tflite_model = converter.convert()
     
-    with open('./Models/Jeff_2.tflite', 'wb') as f:
+    with open('./Models/test.tflite', 'wb') as f:
         f.write(tflite_model)
     print('TFLite models saved successfully')
 

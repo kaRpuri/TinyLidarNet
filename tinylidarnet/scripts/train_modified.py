@@ -126,7 +126,7 @@ if __name__ == '__main__':
     print('GPU AVAILABLE:', bool(tf.config.list_physical_devices('GPU')))
 
     # --- Parameters ---
-    bag_paths = ['/home/nvidia/f1tenth_ws/src/TinyLidarNet/tinylidarnet/scripts/sim_Dataset/test_levine4/test_levine4_0.db3']
+    bag_paths = ['/home/nvidia/f1tenth_ws/src/TinyLidarNet/tinylidarnet/scripts/car_Dataset/controller_slow_5min/controller_slow_5min_0.db3', '/home/nvidia/f1tenth_ws/src/TinyLidarNet/tinylidarnet/scripts/car_Dataset/controller_slow_10min/controller_slow_10.db3']
     seq_len    = 5
     batch_size = 64
     lr         = 5e-5
@@ -192,7 +192,8 @@ if __name__ == '__main__':
     ]
     tflite_model = converter.convert()
     os.makedirs('Models', exist_ok=True)
-    with open('Models/RNN_Attn_Controller.tflite', 'wb') as f:
+    # with open('Models/RNN_Attn_Controller.tflite', 'wb') as f:
+    with open('Models/test.tflite', 'wb') as f:
         f.write(tflite_model)
     print('TFLite model saved.')
 
